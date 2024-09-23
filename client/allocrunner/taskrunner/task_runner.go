@@ -534,6 +534,8 @@ func (tr *TaskRunner) initLabels() {
 // It should be invoked when alloc runner prestart hooks fail.
 // Afterwards, Run() will perform any necessary cleanup.
 func (tr *TaskRunner) MarkFailedKill(reason string) {
+	tr.logger.Trace("MarkFailedKill called with", "reason", reason)
+
 	// Emit an event that fails the task and gives reasons for humans.
 	event := structs.NewTaskEvent(structs.TaskSetupFailure).
 		SetKillReason(structs.TaskRestoreFailed).
@@ -557,6 +559,8 @@ func (tr *TaskRunner) Run() {
 	runComplete := tr.localState.RunComplete
 	tr.stateLock.RUnlock()
 
+	tr.logger.Trace("task runner starting", "dead", dead, "run_complete", runComplete)
+
 	// If restoring a dead task, ensure the task is cleared and, if the local
 	// state indicates that the previous Run() call is complete, execute all
 	// post stop hooks and exit early, otherwise proceed until the
@@ -565,12 +569,16 @@ func (tr *TaskRunner) Run() {
 		// do cleanup functions without emitting any additional events/work
 		// to handle cases where we restored a dead task where client terminated
 		// after task finished before completing post-run actions.
+
+		tr.logger.Trace("task is dead; cleaning up and exiting")
+
 		tr.clearDriverHandle()
 		tr.stateUpdater.TaskStateUpdated()
 		if runComplete {
 			if err := tr.stop(); err != nil {
 				tr.logger.Error("stop failed on terminal task", "error", err)
 			}
+			tr.logger.Trace("task run loop exiting")
 			return
 		}
 	}
@@ -588,11 +596,14 @@ func (tr *TaskRunner) Run() {
 		case <-tr.killCtx.Done():
 			tr.logger.Info("task killed while waiting for server contact")
 		case <-tr.shutdownCtx.Done():
+			tr.logger.Trace("task runner shutting down while waiting for server contact")
 			return
 		case <-tr.serversContactedCh:
 			tr.logger.Info("server contacted; unblocking waiting task")
 		}
 	}
+
+	tr.logger.Trace("task run start TaskStateUpdated")
 
 	// Set the initial task state.
 	tr.stateUpdater.TaskStateUpdated()
@@ -604,19 +615,25 @@ func (tr *TaskRunner) Run() {
 MAIN:
 	for !tr.shouldShutdown() {
 		if dead {
+			tr.logger.Trace("task is dead; skipping MAIN loop")
 			break
 		}
 
 		select {
 		case <-tr.killCtx.Done():
+			// Task was killed
+			tr.logger.Trace("task killed before starting")
 			break MAIN
 		case <-tr.shutdownCtx.Done():
 			// TaskRunner was told to exit immediately
+			tr.logger.Trace("TaskRunner was told to exit immediately")
 			return
 		case <-tr.startConditionMetCh:
 			tr.logger.Debug("lifecycle start condition has been met, proceeding")
 			// yay proceed
 		}
+
+		tr.logger.Trace("task run prestart hooks starting")
 
 		// Run the prestart hooks
 		if err := tr.prestart(); err != nil {
@@ -625,6 +642,8 @@ MAIN:
 			goto RESTART
 		}
 
+		tr.logger.Trace("Prestart hooks completed successfully")
+
 		// Unblocks when the task runner is allowed to continue. (Enterprise)
 		if err := tr.pauser.Wait(); err != nil {
 			tr.logger.Error("pause scheduled failed", "error", err)
@@ -632,20 +651,27 @@ MAIN:
 			break MAIN
 		}
 
+		tr.logger.Trace("task run check shouldShutdown after prestart hooks")
+
 		// Check for a terminal allocation once more before proceeding as the
 		// prestart hooks may have been skipped.
 		if tr.shouldShutdown() {
+			tr.logger.Trace("task should shutdown after prestart hooks")
 			break MAIN
 		}
 
 		select {
 		case <-tr.killCtx.Done():
+			tr.logger.Trace("task killed before starting line:663")
 			break MAIN
 		case <-tr.shutdownCtx.Done():
+			tr.logger.Trace("TaskRunner was told to exit immediately line:666")
 			// TaskRunner was told to exit immediately
 			return
 		default:
 		}
+
+		tr.logger.Trace("task run driver starting")
 
 		// Run the task
 		if err := tr.runDriver(); err != nil {
@@ -654,14 +680,19 @@ MAIN:
 			goto RESTART
 		}
 
+		tr.logger.Trace("task run driver completed")
+
 		// Run the poststart hooks
 		if err := tr.poststart(); err != nil {
 			tr.logger.Error("poststart failed", "error", err)
 		}
 
+		tr.logger.Trace("task run poststart hooks completed")
+
 		// Grab the result proxy and wait for task to exit
 	WAIT:
 		{
+			tr.logger.Trace("task run wait starting")
 			handle := tr.getDriverHandle()
 			result = nil
 
@@ -671,45 +702,62 @@ MAIN:
 			if resultCh, err := handle.WaitCh(context.Background()); err != nil {
 				tr.logger.Error("wait task failed", "error", err)
 			} else {
+				tr.logger.Trace("task run wait completed")
 				select {
 				case <-tr.killCtx.Done():
 					// We can go through the normal should restart check since
 					// the restart tracker knowns it is killed
+					tr.logger.Trace("task killed while waiting for task to exit")
 					result = tr.handleKill(resultCh)
 				case <-tr.shutdownCtx.Done():
 					// TaskRunner was told to exit immediately
+					tr.logger.Trace("TaskRunner was told to exit immediately while waiting for task to exit")
 					return
 				case result = <-resultCh:
+					tr.logger.Trace("task exited", "result", result)
 				}
 
 				// WaitCh returned a result
 				if retryWait := tr.handleTaskExitResult(result); retryWait {
+					tr.logger.Trace("task exited but should be restarted")
 					goto WAIT
 				}
 			}
 		}
 
+		tr.logger.Trace("task run wait completed")
+
 		// Clear the handle
 		tr.clearDriverHandle()
 
+		tr.logger.Trace("clearDriverHandle completed")
+
 		// Store the wait result on the restart tracker
 		tr.restartTracker.SetExitResult(result)
+
+		tr.logger.Trace("restart tracker set exit result", "result", result)
 
 		if err := tr.exited(); err != nil {
 			tr.logger.Error("exited hooks failed", "error", err)
 		}
 
+		tr.logger.Trace("exited hooks completed")
+
 	RESTART:
 		restart, restartDelay := tr.shouldRestart()
 		if !restart {
+			tr.logger.Trace("task should not restart")
 			break MAIN
 		}
+
+		tr.logger.Trace("task should restart", "delay", restartDelay)
 
 		timer.Reset(restartDelay)
 
 		// Actually restart by sleeping and also watching for destroy events
 		select {
 		case <-timer.C:
+			tr.logger.Trace("task restarting")
 		case <-tr.killCtx.Done():
 			tr.logger.Trace("task killed between restarts", "delay", restartDelay)
 			break MAIN
@@ -724,16 +772,24 @@ MAIN:
 	// that should be terminal, so if the handle still exists we should
 	// kill it here.
 	if tr.getDriverHandle() != nil {
+		tr.logger.Trace("task runner cleaning up handle after main loop")
 		if result = tr.handleKill(nil); result != nil {
+			tr.logger.Trace("task runner handle cleanup failed", "result", result)
 			tr.emitExitResultEvent(result)
 		}
 
+		// Clear the handle
+		tr.logger.Trace("task runner clearing handle after main loop")
 		tr.clearDriverHandle()
 
+		tr.logger.Trace("task runner handle cleanup completed")
 		if err := tr.exited(); err != nil {
 			tr.logger.Error("exited hooks failed while cleaning up terminal task", "error", err)
 		}
+		tr.logger.Trace("task runner exited hooks completed")
 	}
+
+	tr.logger.Trace("task runner exiting")
 
 	// Mark the task as dead
 	tr.UpdateState(structs.TaskStateDead, nil)
@@ -747,13 +803,17 @@ MAIN:
 		for {
 			select {
 			case <-tr.killCtx.Done():
+				tr.logger.Trace("Kill context done while waiting for alloc restart line 804")
 				break ALLOC_RESTART
 			case <-tr.shutdownCtx.Done():
+				tr.logger.Trace("TaskRunner was told to exit immediately while waiting for alloc restart line 807")
 				return
 			case <-tr.restartCh:
+				tr.logger.Trace("task runner received restart signal line 810")
 				// Restart without delay since the task is not running anymore.
 				restart, _ := tr.shouldRestart()
 				if restart {
+					tr.logger.Trace("task runner restarting after receiving restart signal line 814")
 					// Set runner as not dead to allow the MAIN loop to run.
 					dead = false
 					goto MAIN
@@ -761,6 +821,8 @@ MAIN:
 			}
 		}
 	}
+
+	tr.logger.Trace("task runner exiting after waiting for alloc restart")
 
 	tr.stateLock.Lock()
 	tr.localState.RunComplete = true
@@ -770,6 +832,7 @@ MAIN:
 	}
 	tr.stateLock.Unlock()
 
+	tr.logger.Trace("task runner run the stop hooks")
 	// Run the stop hooks
 	if err := tr.stop(); err != nil {
 		tr.logger.Error("stop failed", "error", err)
@@ -781,12 +844,16 @@ MAIN:
 func (tr *TaskRunner) shouldShutdown() bool {
 	alloc := tr.Alloc()
 	if alloc.ClientTerminalStatus() {
+		tr.logger.Trace("shouldShutdown clientterminalstatus")
 		return true
 	}
 
 	if !tr.IsPoststopTask() && alloc.ServerTerminalStatus() {
+		tr.logger.Trace("shouldShutdown IsPoststopTask && serverterminalstatus")
 		return true
 	}
+
+	tr.logger.Trace("shouldShutdown false")
 
 	return false
 }
